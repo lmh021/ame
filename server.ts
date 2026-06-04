@@ -224,8 +224,19 @@ app.post("/api/parse-apple-music", async (req, res) => {
   try {
     const response = await fetch(cleanUrl, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"",
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": "\"Windows\"",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+        "Cache-Control": "max-age=0"
       },
     });
 
@@ -237,6 +248,26 @@ app.post("/api/parse-apple-music", async (req, res) => {
 
     // 1. Try JSON-LD tracks extraction (covers both single tracks, full albums, and playlists!)
     const allTracks = extractTracksFromJsonLd(html);
+
+    // Block detection
+    const looksBlocked = html.length < 15000 || 
+                         html.includes("Access Denied") || 
+                         html.includes("captcha") || 
+                         html.includes("robot") || 
+                         html.includes("forbidden") || 
+                         html.includes("verify your identity") ||
+                         html.includes("unusual traffic");
+
+    if (allTracks.length === 0) {
+      if (looksBlocked) {
+        throw new Error(
+          `Apple Music blocked the request. Cloud hosting providers (such as DigitalOcean, AWS, Hetzner, Vercel, etc.) have their IP ranges pre-blocked by Apple's CDN. Run on another hosting platform or a residential line to avoid blocks. (HTML size: ${html.length} bytes)`
+        );
+      }
+      if (cleanUrl.includes("/playlist/") || cleanUrl.includes("/album/")) {
+        throw new Error("The playlist/album URL loaded successfully but contains 0 publicly accessible tracks. Make sure the playlist/album is shared and set to public.");
+      }
+    }
 
     if (allTracks.length > 0) {
       // Check if URL has a specific track ID query parameter "?i=..." 

@@ -84,6 +84,12 @@ export default function App() {
     setSheetError(null);
     try {
       const response = await fetch("/api/sheet");
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("text/html")) {
+        throw new Error(
+          "Static Server Fallback Detected: The backend API returned HTML instead of JSON. This usually means the Express backend containing the scraper is not running (meaning your host, e.g. Vercel, Netlify, or GitHub Pages, is running the app as a client-side static SPA only). To enable full scraping capabilities, make sure to host the app in a container or Node platform that runs the custom Express server with 'npm run build' followed by 'npm run start'."
+        );
+      }
       if (!response.ok) {
         throw new Error(`HTTP Error ${response.status}: Failed to read spreadsheet.`);
       }
@@ -133,6 +139,7 @@ export default function App() {
     });
 
     const parsedTracks: { songName: string; artistName: string; cleanUrl: string }[] = [];
+    const crawlErrors: string[] = [];
 
     for (let i = 0; i < matches.length; i++) {
       const rawUrl = matches[i];
@@ -149,6 +156,13 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url: rawUrl })
         });
+
+        const contentType = response.headers.get("content-type") || "";
+        if (contentType.includes("text/html")) {
+          throw new Error(
+            "Backend server is offline (Vercel/Netlify/GitHub Pages static SPA fallback is intercepting requests as index.html instead of hitting the Node.js Express server)."
+          );
+        }
 
         if (!response.ok) {
           const errData = await response.json().catch(() => ({}));
@@ -191,6 +205,7 @@ export default function App() {
         }
       } catch (err: any) {
         console.error(`Error on crawler index ${i}:`, err);
+        crawlErrors.push(err.message || String(err));
         setCrawlingProgress((prev) => ({
           ...prev,
           failedCount: prev.failedCount + 1,
@@ -223,7 +238,8 @@ export default function App() {
         showToast(`Error writing to sheet: ${err.message}`, "error");
       }
     } else {
-      showToast("Crawler finished but no tracks were successfully extracted.", "error");
+      const lastError = crawlErrors[crawlErrors.length - 1] || "No valid Apple Music links were successfully parsed.";
+      showToast(`Scrape failed: ${lastError}`, "error");
     }
 
     setCrawlingProgress((prev) => ({
