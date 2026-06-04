@@ -222,14 +222,17 @@ function parseAppleMusicUrlDetails(rawUrl: string) {
     let type = ""; // "album", "playlist", "song"
     let id = "";
     let songId = url.searchParams.get("i") || "";
+    let slugName = "";
 
     if (pathParts.length >= 2) {
       if (pathParts[0].length === 2) {
         country = pathParts[0];
         type = pathParts[1];
+        slugName = pathParts[2] || "";
         id = pathParts[3] || pathParts[2] || "";
       } else {
         type = pathParts[0];
+        slugName = pathParts[1] || "";
         id = pathParts[2] || pathParts[1] || "";
       }
     }
@@ -238,13 +241,19 @@ function parseAppleMusicUrlDetails(rawUrl: string) {
       type = "song";
     }
 
-    return { country, type, id, songId };
+    // Clean up slugName (e.g. "starboy-feat-daft-punk" -> "starboy feat daft punk")
+    let searchTerm = "";
+    if (slugName && slugName !== "album" && slugName !== "playlist" && slugName !== "song") {
+      searchTerm = decodeURIComponent(slugName).replace(/[-_]/g, " ").trim();
+    }
+
+    return { country, type, id, songId, searchTerm };
   } catch (e) {
     return null;
   }
 }
 
-async function fetchFromItunes(country: string, type: string, id: string, songId: string) {
+async function fetchFromItunes(country: string, type: string, id: string, songId: string, searchTerm: string = "") {
   // If we have a song ID, lookup the song directly
   if (songId) {
     const songUrl = `https://itunes.apple.com/lookup?id=${songId}&country=${country}`;
@@ -308,6 +317,59 @@ async function fetchFromItunes(country: string, type: string, id: string, songId
       }
     } catch (e) {
       console.error("iTunes album lookup error:", e);
+    }
+  }
+
+  // Search Fallback if ID-lookup returned 0 items
+  if (searchTerm) {
+    const isPlaylist = type === "playlist";
+    const entity = type === "album" ? "album" : "song";
+    const searchUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(searchTerm)}&country=${country}&entity=${entity}&limit=10`;
+    try {
+      const res = await fetch(searchUrl);
+      if (res.ok) {
+        const body = (await res.json()) as any;
+        if (body.results && body.results.length > 0) {
+          if (entity === "song") {
+            const m = body.results[0];
+            return {
+              success: true,
+              songName: m.trackName || "",
+              artistName: m.artistName || "",
+              cleanUrl: m.trackViewUrl || `https://music.apple.com/${country}/album/${m.collectionId}?i=${m.trackId}`,
+              method: "iTunes Search Slug Match"
+            };
+          } else {
+            // Album or general playlist fallback (fetch tracklist)
+            const firstResult = body.results[0];
+            if (firstResult.collectionId) {
+              const albumLookupUrl = `https://itunes.apple.com/lookup?id=${firstResult.collectionId}&entity=song&country=${country}`;
+              const albumRes = await fetch(albumLookupUrl);
+              if (albumRes.ok) {
+                const albumBody = (await albumRes.json()) as any;
+                if (albumBody.results && albumBody.results.length > 0) {
+                  const songs = albumBody.results.filter((r: any) => r.wrapperType === "track" && r.kind === "song");
+                  if (songs.length > 0) {
+                    const tracks = songs.map((s: any) => ({
+                      songName: s.trackName || "Unknown Song",
+                      artistName: s.artistName || "Unknown Artist",
+                      cleanUrl: s.trackViewUrl || `https://music.apple.com/${country}/album/${firstResult.collectionId}?i=${s.trackId}`
+                    }));
+                    return {
+                      success: true,
+                      isPlaylist: true,
+                      tracks,
+                      method: "iTunes Search Fallback Album Tracklist"
+                    };
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error("iTunes search keyword fallback error:", e);
     }
   }
 
@@ -509,7 +571,8 @@ Return strictly a JSON object with this shape (no markdown, no quotes wrapping t
         urlDetails.country,
         urlDetails.type,
         urlDetails.id,
-        urlDetails.songId
+        urlDetails.songId,
+        urlDetails.searchTerm
       );
       if (itunesResult) {
         console.log(`Unblocked iTunes Store lookup API succeeded using method: ${itunesResult.method}!`);
@@ -530,6 +593,70 @@ Return strictly a JSON object with this shape (no markdown, no quotes wrapping t
     return res.status(500).json({
       error: userMsg
     });
+  }
+});
+
+// Endpoint to parse copy-pasted HTML or plaintext using Gemini AI
+app.post("/api/parse-pasted-content", async (req, res) => {
+  const { content } = req.body;
+  if (!content || typeof content !== "string") {
+    return res.status(400).json({ error: "Content is required" });
+  }
+
+  const ai = getGeminiClient();
+  if (!ai) {
+    return res.status(500).json({ error: "Gemini API key is not configured. Please add it to your settings." });
+  }
+
+  try {
+    const prompt = `You are an expert music metadata extractor. The user has provided an outline or text copy-pasted of an Apple Music playlist, album, or song page.
+Extract ALL tracks mentioned in the content.
+For each track, identify:
+1. songName: The clean title of the song (exclude track index/number prefixes or duration times).
+2. artistName: The main artist or creators of the song. If unknown, guess or use context.
+3. cleanUrl: The closest corresponding Apple Music URL link for that specific song found in the text, or a general clean track URL link if present. If there is no specific URL track link, leave it as empty "".
+
+Return STRICTLY a JSON object matching this schema (do NOT wrap it in any Markdown code blocks, just raw JSON, and do not add any conversational text):
+{
+  "tracks": [
+    {
+      "songName": "Track TitleName",
+      "artistName": "Artist Name",
+      "cleanUrl": "https://music.apple.com/us/album/..."
+    }
+  ]
+}
+
+Content to parse:
+${content.substring(0, 45000)}
+`;
+
+    const geminiResult = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+      },
+    });
+
+    const textResult = geminiResult.text?.trim() || "{}";
+    try {
+      const parsed = JSON.parse(textResult);
+      if (parsed.tracks && Array.isArray(parsed.tracks)) {
+        return res.json({
+          success: true,
+          tracks: parsed.tracks,
+          method: "Gemini AI Paste Parser"
+        });
+      }
+      throw new Error("Invalid output format from AI model");
+    } catch (parseErr: any) {
+      console.error("Gemini output parsing failed:", textResult, parseErr);
+      return res.status(500).json({ error: "Failed to parse AI structure: " + parseErr.message });
+    }
+  } catch (err: any) {
+    console.error("Gemini pasted content error:", err);
+    return res.status(500).json({ error: err.message || String(err) });
   }
 });
 

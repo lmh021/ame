@@ -426,12 +426,85 @@ export default function App() {
       logs: ["Starting Client-Side Page Source Raw Parser... (No-Cloud, 100% Unblocked Bypass)"]
     });
 
+    const getCompactPageRepresentation = (html: string): string => {
+      try {
+        if (!html.includes("<") || !html.includes(">")) {
+          return html.substring(0, 40000);
+        }
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, "text/html");
+        
+        const tagsToRemove = ["script", "style", "svg", "noscript", "iframe", "header", "footer", "meta", "canvas"];
+        tagsToRemove.forEach(tag => {
+          doc.querySelectorAll(tag).forEach(el => el.remove());
+        });
+
+        const lines: string[] = [];
+        const walk = (node: Node) => {
+          if (node.nodeType === Node.TEXT_NODE) {
+            const txt = node.textContent?.trim();
+            if (txt && txt.length > 1) {
+              lines.push(txt);
+            }
+          } else if (node.nodeType === Node.ELEMENT_NODE) {
+            const el = node as HTMLElement;
+            if (el.tagName === "A") {
+              const href = el.getAttribute("href") || "";
+              const txt = el.textContent?.trim() || "";
+              if (txt && href) {
+                lines.push(`Link: [${txt}](${href})`);
+              }
+              return;
+            }
+            for (let i = 0; i < el.childNodes.length; i++) {
+              walk(el.childNodes[i]);
+            }
+          }
+        };
+
+        if (doc.body) walk(doc.body);
+        const resultText = lines.join("\n").trim();
+        return resultText ? resultText.substring(0, 40000) : html.substring(0, 20000);
+      } catch (e) {
+        return html.substring(0, 20000);
+      }
+    };
+
     try {
-      const parsedTracks = extractTracksFromHtmlStr(htmlInput);
+      let parsedTracks = extractTracksFromHtmlStr(htmlInput);
+      let methodUsed = "Local Browser Engine";
+
       if (parsedTracks.length === 0) {
-        throw new Error(
-          "Unrecognized Apple Music source data. Make sure you pasted the FULL original code. Tip: Open playlist in safari/chrome, right-click -> View Page Source (or Cmd+Option+U), copy everything, and paste!"
-        );
+        setCrawlingProgress((prev) => ({
+          ...prev,
+          logs: [
+            ...prev.logs,
+            "Local schema scanner found 0 records.",
+            "Invoking backend Gemini AI intelligent text parsing fallback channel..."
+          ],
+          currentLabel: "Packaging page content for Gemini Extraction..."
+        }));
+
+        const compactContent = getCompactPageRepresentation(htmlInput);
+
+        const aiResponse = await fetch("/api/parse-pasted-content", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: compactContent })
+        });
+
+        if (!aiResponse.ok) {
+          const aiErr = await aiResponse.json().catch(() => ({}));
+          throw new Error(aiErr.error || "Advanced AI parsing failed to extract tracks.");
+        }
+
+        const aiData = await aiResponse.json();
+        if (!aiData.tracks || aiData.tracks.length === 0) {
+          throw new Error("Advanced AI Paste Parser could not find any recognizable songs in this text paste.");
+        }
+
+        parsedTracks = aiData.tracks;
+        methodUsed = "Gemini AI Paste Engine";
       }
 
       setCrawlingProgress((prev) => ({
@@ -439,13 +512,13 @@ export default function App() {
         successCount: parsedTracks.length,
         logs: [
           ...prev.logs,
-          `SUCCESS: Unpacked ${parsedTracks.length} song metadata nodes directly on current device!`
+          `SUCCESS: Extracted ${parsedTracks.length} track(s) using [${methodUsed}]!`
         ]
       }));
 
       setCrawlingProgress((prev) => ({
         ...prev,
-        currentLabel: `Writing new ${parsedTracks.length} ledger rows into server database JSON...`
+        currentLabel: `Writing ${parsedTracks.length} rows to the sheet...`
       }));
 
       // Append tracks
