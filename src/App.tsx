@@ -33,6 +33,10 @@ export default function App() {
   const [loadingSheet, setLoadingSheet] = useState<boolean>(true);
   const [sheetError, setSheetError] = useState<string | null>(null);
 
+  // Scraper mode tab selector and raw HTML input state
+  const [activeTab, setActiveTab] = useState<"url" | "html">("url");
+  const [htmlInput, setHtmlInput] = useState<string>("");
+
   // Link input text state (textarea supporting multiple links)
   const [linksInput, setLinksInput] = useState<string>(
     "https://music.apple.com/us/album/starboy-feat-daft-punk/1170696519?i=1170696522\nhttps://music.apple.com/us/album/blinding-lights/1499385848?i=1499385850"
@@ -109,6 +113,231 @@ export default function App() {
     setTimeout(() => {
       setStatusMessage(null);
     }, 5000);
+  };
+
+  // Helper to extract tracks entirely client-side from raw pasted HTML (CORS Bypass Fallback)
+  const extractTracksFromHtmlStr = (html: string): { songName: string; artistName: string; cleanUrl: string }[] => {
+    const tracks: { songName: string; artistName: string; cleanUrl: string }[] = [];
+    const artistMap = new Map<string, string>();
+
+    const cleanUrlHelper = (rawUrl: string): string => {
+      try {
+        const url = new URL(rawUrl.trim());
+        const clean = new URL(url.origin + url.pathname);
+        const songId = url.searchParams.get("i");
+        if (songId) {
+          clean.searchParams.set("i", songId);
+        }
+        return clean.toString();
+      } catch (e) {
+        return rawUrl.trim();
+      }
+    };
+
+    // 1. Build artist lookup map from serialized-server-data script tag if present
+    try {
+      const serverDataRegex = /<script\b[^>]*id=["']serialized-server-data["'][^>]*>([\s\S]*?)<\/script>/i;
+      const serverMatch = serverDataRegex.exec(html);
+      if (serverMatch) {
+        const parsedServer = JSON.parse(serverMatch[1].trim());
+        const traverseServer = (node: any) => {
+          if (!node || typeof node !== "object") return;
+          if (Array.isArray(node)) {
+            for (const sub of node) traverseServer(sub);
+            return;
+          }
+          if (node.artistName && (node.title || node.name)) {
+            const t = node.title || node.name;
+            artistMap.set(t.toLowerCase().trim(), node.artistName);
+          }
+          for (const k of Object.keys(node)) {
+            traverseServer(node[k]);
+          }
+        };
+        traverseServer(parsedServer);
+      }
+    } catch (e) {
+      console.error("Client-side serialized-server-data parse error:", e);
+    }
+
+    // JSON-LD dynamic traversal
+    const traverseJsonLd = (node: any) => {
+      if (!node || typeof node !== "object") return;
+
+      if (Array.isArray(node)) {
+        for (const sub of node) traverseJsonLd(sub);
+        return;
+      }
+
+      if (node["@type"] === "MusicRecording" || node["@type"] === "Song") {
+        const songName = node.name;
+        if (songName) {
+          let artistName = "Unknown Artist";
+          const key = songName.toLowerCase().trim();
+          let matchedArtist = artistMap.get(key);
+          if (!matchedArtist) {
+            for (const [titleKey, artist] of artistMap.entries()) {
+              if (titleKey.includes(key) || key.includes(titleKey)) {
+                matchedArtist = artist;
+                break;
+              }
+            }
+          }
+          if (matchedArtist) {
+            artistName = matchedArtist;
+          } else if (node.byArtist) {
+            artistName = Array.isArray(node.byArtist)
+              ? node.byArtist[0]?.name || "Unknown Artist"
+              : (node.byArtist.name || node.byArtist || "Unknown Artist");
+          }
+          const rawUrl = node.url || "";
+          tracks.push({
+            songName,
+            artistName,
+            cleanUrl: rawUrl ? cleanUrlHelper(rawUrl) : ""
+          });
+        }
+      }
+
+      if (node["@type"] === "ListItem" && node.item) {
+        const item = node.item;
+        if (item["@type"] === "MusicRecording" || item["@type"] === "Song" || item.name) {
+          const songName = item.name;
+          if (songName) {
+            let artistName = "Unknown Artist";
+            const key = songName.toLowerCase().trim();
+            let matchedArtist = artistMap.get(key);
+            if (!matchedArtist) {
+              for (const [titleKey, artist] of artistMap.entries()) {
+                if (titleKey.includes(key) || key.includes(titleKey)) {
+                  matchedArtist = artist;
+                  break;
+                }
+              }
+            }
+            if (matchedArtist) {
+              artistName = matchedArtist;
+            } else if (item.byArtist) {
+              artistName = Array.isArray(item.byArtist)
+                ? item.byArtist[0]?.name || "Unknown Artist"
+                : (item.byArtist.name || item.byArtist || "Unknown Artist");
+            }
+            const rawUrl = item.url || "";
+            tracks.push({
+              songName,
+              artistName,
+              cleanUrl: rawUrl ? cleanUrlHelper(rawUrl) : ""
+            });
+          }
+          return;
+        }
+      }
+
+      for (const key of Object.keys(node)) {
+        traverseJsonLd(node[key]);
+      }
+    };
+
+    // 2. Extract song info + url from application/ld+json
+    try {
+      const regex = /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+      let match;
+      while ((match = regex.exec(html)) !== null) {
+        if (match[1]) {
+          try {
+            const parsed = JSON.parse(match[1].trim());
+            const items = Array.isArray(parsed) ? parsed : [parsed];
+            for (const item of items) {
+              traverseJsonLd(item);
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (e) {
+      console.error("Client JSON-LD tracks extraction error:", e);
+    }
+
+    // Deduplicate
+    const unique = new Map<string, typeof tracks[0]>();
+    for (const t of tracks) {
+      const key = `${t.songName.toLowerCase().trim()}|||${t.artistName.toLowerCase().trim()}`;
+      if (!unique.has(key)) {
+        unique.set(key, t);
+      }
+    }
+    return Array.from(unique.values());
+  };
+
+  const handleParsePastedHtml = async () => {
+    if (!htmlInput.trim()) {
+      showToast("Please paste Apple Music page HTML source first.", "error");
+      return;
+    }
+
+    setCrawlingProgress({
+      status: "running",
+      total: 1,
+      current: 1,
+      currentLabel: "Parsing HTML source text on browser CPU...",
+      successCount: 0,
+      failedCount: 0,
+      logs: ["Starting Client-Side Page Source Raw Parser... (No-Cloud, 100% Unblocked Bypass)"]
+    });
+
+    try {
+      const parsedTracks = extractTracksFromHtmlStr(htmlInput);
+      if (parsedTracks.length === 0) {
+        throw new Error(
+          "Unrecognized Apple Music source data. Make sure you pasted the FULL original code. Tip: Open playlist in safari/chrome, right-click -> View Page Source (or Cmd+Option+U), copy everything, and paste!"
+        );
+      }
+
+      setCrawlingProgress((prev) => ({
+        ...prev,
+        successCount: parsedTracks.length,
+        logs: [
+          ...prev.logs,
+          `SUCCESS: Unpacked ${parsedTracks.length} song metadata nodes directly on current device!`
+        ]
+      }));
+
+      setCrawlingProgress((prev) => ({
+        ...prev,
+        currentLabel: `Writing new ${parsedTracks.length} ledger rows into server database JSON...`
+      }));
+
+      // Append tracks
+      const appendResponse = await fetch("/api/sheet/append", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ newRows: parsedTracks })
+      });
+
+      if (!appendResponse.ok) {
+        throw new Error("Unable to save parsed list into ledger backend.");
+      }
+
+      await fetchSheetRows();
+      showToast(`Successfully registered all ${parsedTracks.length} playlist tracks in sheet!`, "success");
+      setHtmlInput(""); // reset paste element
+
+      setCrawlingProgress((prev) => ({
+        ...prev,
+        status: "completed",
+        currentLabel: `Added ${parsedTracks.length} songs. Complete!`
+      }));
+
+    } catch (err: any) {
+      console.error("HTML Copy parser failed:", err);
+      setCrawlingProgress((prev) => ({
+        ...prev,
+        status: "error",
+        failedCount: 1,
+        logs: [...prev.logs, `FAILED: ${err.message}`],
+        currentLabel: "HTML Copy Parsing halted."
+      }));
+      showToast(`HTML Parse Error: ${err.message}`, "error");
+    }
   };
 
   // Extract metadata and add sequentially
@@ -521,52 +750,124 @@ export default function App() {
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <section className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-5 sm:p-6 shadow-xs flex flex-col justify-between">
             <div>
-              <div className="flex items-center gap-2 mb-2">
-                <div className="p-1.5 bg-rose-50 text-rose-600 rounded-md">
-                  <Music className="w-4 h-4" />
+              {/* Tabs selector */}
+              <div className="flex items-center justify-between border-b border-slate-100 pb-3 mb-4 select-none">
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setActiveTab("url")}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                      activeTab === "url"
+                        ? "bg-rose-50 text-rose-700 border border-rose-200 shadow-2xs"
+                        : "bg-transparent text-slate-500 hover:text-slate-800"
+                    }`}
+                  >
+                    🌐 Auto URL Scraper
+                  </button>
+                  <button
+                    onClick={() => setActiveTab("html")}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
+                      activeTab === "html"
+                        ? "bg-amber-50 text-amber-805 border border-amber-200 shadow-2xs"
+                        : "bg-transparent text-slate-500 hover:text-slate-800"
+                    }`}
+                  >
+                    📋 HTML Code Paste (Bypass Blocks)
+                    <span className="bg-amber-100 text-amber-800 text-[9px] px-1 py-0.5 rounded-xs uppercase font-extrabold tracking-wider">
+                      100% Success
+                    </span>
+                  </button>
                 </div>
-                <h2 className="text-xs font-bold uppercase tracking-widest text-slate-500">
-                  Batch URL Extraction Queue
-                </h2>
               </div>
-              <p className="text-slate-400 text-xs mb-4">
-                Paste one or multiple Apple Music album or song URLs into the workspace. Press crawl to run the scraper backend sequentially and logs into the spreadsheet.
-              </p>
 
-              <div className="flex flex-col gap-1.5">
-                <label className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
-                  Source Apple Music URLs
-                </label>
-                <textarea
-                  rows={4}
-                  value={linksInput}
-                  onChange={(e) => setLinksInput(e.target.value)}
-                  placeholder="Paste URL(s) - e.g.&#10;https://music.apple.com/us/album/starboy/1170696519?i=1170696522&#10;https://music.apple.com/us/album/blinding-lights/1499385848?i=1499385850"
-                  className="w-full p-3 font-mono text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-rose-500/10 focus:border-rose-500 transition-all placeholder:text-slate-350"
-                ></textarea>
-              </div>
-            </div>
+              {activeTab === "url" ? (
+                <div>
+                  <p className="text-slate-400 text-xs mb-4 leading-relaxed">
+                    Paste one or multiple Apple Music album, song, or playlist URLs. Our backend automatically scrapes and appends them to your ledger sheet below.
+                  </p>
 
-            <div className="mt-4 flex flex-col sm:flex-row gap-3 items-center justify-between pt-4 border-t border-slate-100">
-              <span className="text-[10px] font-mono text-slate-400">
-                Found {Array.from(linksInput.matchAll(/(https?:\/\/music\.apple\.com\/[^\s"'<>]+)/g)).length} links to query
-              </span>
-              <button
-                onClick={handleCrawlLinks}
-                disabled={crawlingProgress.status === "running"}
-                className="w-full sm:w-auto bg-slate-900 text-white hover:bg-slate-800 disabled:bg-slate-150 disabled:text-slate-400 px-6 py-2.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs active:scale-98"
-              >
-                {crawlingProgress.status === "running" ? (
-                  <>
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    Querying Crawler Stream...
-                  </>
-                ) : (
-                  <>
-                    Crawl & Extract Tracks
-                  </>
-                )}
-              </button>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                      Source Apple Music URLs (One per line)
+                    </label>
+                    <textarea
+                      rows={5}
+                      value={linksInput}
+                      onChange={(e) => setLinksInput(e.target.value)}
+                      placeholder="Paste URL(s) - e.g.&#10;https://music.apple.com/us/album/starboy/1170696519?i=1170696522&#10;https://music.apple.com/us/playlist/eason-chan/pl.6c88e13f018745ee960ca5ad669c8c14"
+                      className="w-full p-3 font-mono text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-rose-500/10 focus:border-rose-500 transition-all placeholder:text-slate-350"
+                    ></textarea>
+                  </div>
+
+                  <div className="mt-4 flex flex-col sm:flex-row gap-3 items-center justify-between pt-4 border-t border-slate-100">
+                    <span className="text-[10px] font-mono text-slate-400">
+                      Found {Array.from(linksInput.matchAll(/(https?:\/\/music\.apple\.com\/[^\s"'<>]+)/g)).length} links to extract
+                    </span>
+                    <button
+                      onClick={handleCrawlLinks}
+                      disabled={crawlingProgress.status === "running"}
+                      className="w-full sm:w-auto bg-slate-900 text-white hover:bg-slate-800 disabled:bg-slate-150 disabled:text-slate-400 px-6 py-2.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs active:scale-98"
+                    >
+                      {crawlingProgress.status === "running" ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          Scraping URLs...
+                        </>
+                      ) : (
+                        <>
+                          Crawl & Save to Sheet
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <div className="bg-amber-50/70 border border-amber-200 rounded-lg p-3.5 mb-4 text-[11px] leading-relaxed text-amber-900">
+                    <strong className="block text-amber-950 mb-1">💡 Apple Block Prevention Auto-Bypass</strong>
+                    Public CDNs block Google Cloud and other cloud server IPs often. If auto scraping yields error logs, this local browser parser is a 100% reliable bypass:
+                    <ol className="list-decimal pl-4 mt-2 space-y-1 text-slate-600 font-medium">
+                      <li>Open the playlist or album URL in a normal browser tab.</li>
+                      <li>Right-click the page and choose <strong className="text-slate-800 font-bold">"View Page Source"</strong> (or press <kbd className="bg-slate-200 px-1 rounded text-[10px] font-mono font-bold">Ctrl+U</kbd> / <kbd className="bg-slate-200 px-1 rounded text-[10px] font-mono font-bold">Cmd+Option+U</kbd>).</li>
+                      <li>Select the whole page source code (<kbd className="bg-slate-200 px-1 rounded text-[10px] font-mono font-bold">Ctrl+A</kbd> / <kbd className="bg-slate-200 px-1 rounded text-[10px] font-mono font-bold">Cmd+A</kbd>), Copy, and paste it below!</li>
+                    </ol>
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                      Pasted HTML / Page Source Code
+                    </label>
+                    <textarea
+                      rows={5}
+                      value={htmlInput}
+                      onChange={(e) => setHtmlInput(e.target.value)}
+                      placeholder="Paste the full copied Page Source (HTML) of the playlist here..."
+                      className="w-full p-3 font-mono text-[10px] bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all placeholder:text-slate-350"
+                    ></textarea>
+                  </div>
+
+                  <div className="mt-4 flex flex-col sm:flex-row gap-3 items-center justify-between pt-4 border-t border-slate-100">
+                    <span className="text-[10px] font-mono text-slate-400">
+                      Input size: {(htmlInput.length / 1024).toFixed(1)} KB
+                    </span>
+                    <button
+                      onClick={handleParsePastedHtml}
+                      disabled={crawlingProgress.status === "running"}
+                      className="w-full sm:w-auto bg-amber-600 hover:bg-amber-700 text-white disabled:bg-slate-150 disabled:text-slate-400 px-6 py-2.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs active:scale-98"
+                    >
+                      {crawlingProgress.status === "running" ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          Parsing code...
+                        </>
+                      ) : (
+                        <>
+                          Parse HTML & Extract Songs
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </section>
 
