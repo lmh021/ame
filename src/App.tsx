@@ -122,7 +122,12 @@ export default function App() {
 
     const cleanUrlHelper = (rawUrl: string): string => {
       try {
-        const url = new URL(rawUrl.trim());
+        let absoluteUrl = rawUrl.trim();
+        // Convert relative URLs if copied from inside the browser page
+        if (absoluteUrl.startsWith("/")) {
+          absoluteUrl = "https://music.apple.com" + absoluteUrl;
+        }
+        const url = new URL(absoluteUrl);
         const clean = new URL(url.origin + url.pathname);
         const songId = url.searchParams.get("i");
         if (songId) {
@@ -255,6 +260,143 @@ export default function App() {
       }
     } catch (e) {
       console.error("Client JSON-LD tracks extraction error:", e);
+    }
+
+    // 3. Fallback: Parse HTML DOM using browser's DOMParser (handles copy-pastes of inspected elements and full HTML)
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, "text/html");
+      const allLinks = Array.from(doc.querySelectorAll("a"));
+      const addedKeys = new Set<string>();
+
+      // Load already parsed nodes from JSON-LD to prevent double listings
+      tracks.forEach(t => {
+        addedKeys.add(`${t.songName.toLowerCase().trim()}|||${t.artistName.toLowerCase().trim()}`);
+      });
+
+      allLinks.forEach((a) => {
+        const href = a.getAttribute("href") || "";
+        // Look for links referencing song with its query ID '?i=' or '/album/' path
+        if (href.includes("/album/") && (href.includes("?i=") || href.includes("&i="))) {
+          // Ascend container elements to discover enclosing rows
+          let rowContainer: HTMLElement | null = a.parentElement;
+          let depth = 0;
+          while (rowContainer && depth < 5) {
+            const className = (rowContainer.className || "").toLowerCase();
+            const idAttr = (rowContainer.id || "").toLowerCase();
+            const testId = (rowContainer.getAttribute("data-testid") || "").toLowerCase();
+            const role = (rowContainer.getAttribute("role") || "").toLowerCase();
+            if (
+              className.includes("row") || 
+              className.includes("item") || 
+              className.includes("line") || 
+              className.includes("track") ||
+              testId.includes("row") || 
+              testId.includes("item") || 
+              role === "row" ||
+              rowContainer.tagName === "LI" || 
+              rowContainer.tagName === "TR"
+            ) {
+              break;
+            }
+            rowContainer = rowContainer.parentElement;
+            depth++;
+          }
+
+          const containerToUse = rowContainer || a.parentElement || a;
+          
+          let songName = "";
+          const titleEl = containerToUse.querySelector(
+            '[class*="title"], [class*="song-name"], [class*="track-title"], [data-testid="track-title"]'
+          );
+          if (titleEl && titleEl.textContent && titleEl.textContent.trim()) {
+            songName = titleEl.textContent.trim();
+          } else {
+            songName = a.textContent?.trim() || "";
+          }
+
+          // Clean numbering if present
+          songName = songName.replace(/^\d+[\.\s\-]+/, "").trim();
+
+          let artistName = "";
+          const artistLinks = Array.from(containerToUse.querySelectorAll('a[href*="/artist/"]'));
+          if (artistLinks.length > 0) {
+            artistName = artistLinks.map(al => al.textContent?.trim()).filter(Boolean).join(", ");
+          } else {
+            const artistEl = containerToUse.querySelector(
+              '[class*="artist"], [class*="byline"], [class*="creator"], [class*="sub-title"]'
+            );
+            if (artistEl && artistEl.textContent && artistEl.textContent.trim()) {
+              artistName = artistEl.textContent.trim();
+            }
+          }
+
+          // Auto lookup map for artists
+          const keyLower = songName.toLowerCase().trim();
+          if (!artistName || artistName.toLowerCase() === "unknown artist") {
+            const matchedArtist = artistMap.get(keyLower);
+            if (matchedArtist) {
+              artistName = matchedArtist;
+            } else {
+              for (const [titleKey, artist] of artistMap.entries()) {
+                if (titleKey.includes(keyLower) || keyLower.includes(titleKey)) {
+                  artistName = artist;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (!artistName) {
+            artistName = "Unknown Artist";
+          }
+
+          if (songName) {
+            const uniqueKey = `${songName.toLowerCase().trim()}|||${artistName.toLowerCase().trim()}`;
+            if (!addedKeys.has(uniqueKey)) {
+              addedKeys.add(uniqueKey);
+              tracks.push({
+                songName,
+                artistName,
+                cleanUrl: cleanUrlHelper(href)
+              });
+            }
+          }
+        }
+      });
+
+      // Simple listing copy-paste selector backup
+      if (tracks.length === 0) {
+        const rows = Array.from(doc.querySelectorAll(
+          '[class*="song-list-row"], [class*="track-row"], [class*="songs-list-row"], [data-testid="track-row"], li[class*="track"], tr[class*="track"], div[role="row"]'
+        ));
+        rows.forEach((rowEl) => {
+          const titleEl = rowEl.querySelector('[class*="title"], [class*="song-name"], [class*="track-name"]');
+          const artistEl = rowEl.querySelector('[class*="artist"], [class*="by-line"], [class*="creator"]');
+          const linkEl = rowEl.querySelector('a[href*="/album/"]');
+
+          let songName = titleEl?.textContent?.trim() || "";
+          songName = songName.replace(/^\d+[\.\s\-]+/, "").trim();
+
+          const artistName = artistEl?.textContent?.trim() || "Unknown Artist";
+          const rawUrl = linkEl?.getAttribute("href") || "";
+
+          if (songName) {
+            const uniqueKey = `${songName.toLowerCase().trim()}|||${artistName.toLowerCase().trim()}`;
+            if (!addedKeys.has(uniqueKey)) {
+              addedKeys.add(uniqueKey);
+              tracks.push({
+                songName,
+                artistName,
+                cleanUrl: rawUrl ? cleanUrlHelper(rawUrl) : ""
+              });
+            }
+          }
+        });
+      }
+
+    } catch (domErr) {
+      console.error("Client DOMParser error:", domErr);
     }
 
     // Deduplicate

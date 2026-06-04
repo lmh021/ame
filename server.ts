@@ -213,6 +213,107 @@ function extractMeta(html: string) {
 }
 
 // API endpoint to parse Apple Music links
+function parseAppleMusicUrlDetails(rawUrl: string) {
+  try {
+    const url = new URL(rawUrl.trim());
+    const pathParts = url.pathname.split("/").filter(Boolean); // e.g. ["us", "album", "starboy", "1440870373"]
+    
+    let country = "us";
+    let type = ""; // "album", "playlist", "song"
+    let id = "";
+    let songId = url.searchParams.get("i") || "";
+
+    if (pathParts.length >= 2) {
+      if (pathParts[0].length === 2) {
+        country = pathParts[0];
+        type = pathParts[1];
+        id = pathParts[3] || pathParts[2] || "";
+      } else {
+        type = pathParts[0];
+        id = pathParts[2] || pathParts[1] || "";
+      }
+    }
+
+    if (songId) {
+      type = "song";
+    }
+
+    return { country, type, id, songId };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function fetchFromItunes(country: string, type: string, id: string, songId: string) {
+  // If we have a song ID, lookup the song directly
+  if (songId) {
+    const songUrl = `https://itunes.apple.com/lookup?id=${songId}&country=${country}`;
+    try {
+      const res = await fetch(songUrl);
+      if (res.ok) {
+        const body = (await res.json()) as any;
+        if (body.results && body.results.length > 0) {
+          const m = body.results[0];
+          return {
+            success: true,
+            songName: m.trackName || "",
+            artistName: m.artistName || "",
+            cleanUrl: m.trackViewUrl || `https://music.apple.com/${country}/album/${m.collectionId}?i=${songId}`,
+            method: "iTunes Store API Single Track Match"
+          };
+        }
+      }
+    } catch (e) {
+      console.error("iTunes song lookup error:", e);
+    }
+  }
+
+  // If we have an album ID and type is album or song, fetch its entire tracklist
+  if (id && (type === "album" || type === "song")) {
+    const albumUrl = `https://itunes.apple.com/lookup?id=${id}&entity=song&country=${country}`;
+    try {
+      const res = await fetch(albumUrl);
+      if (res.ok) {
+        const body = (await res.json()) as any;
+        if (body.results && body.results.length > 0) {
+          const songs = body.results.filter((r: any) => r.wrapperType === "track" && r.kind === "song");
+          if (songs.length > 0) {
+            if (songId) {
+              const matched = songs.find((s: any) => String(s.trackId) === songId);
+              if (matched) {
+                return {
+                  success: true,
+                  songName: matched.trackName || "",
+                  artistName: matched.artistName || "",
+                  cleanUrl: matched.trackViewUrl || `https://music.apple.com/${country}/album/${id}?i=${songId}`,
+                  method: "iTunes Store API Album Match"
+                };
+              }
+            }
+
+            const tracks = songs.map((s: any) => ({
+              songName: s.trackName || "Unknown Song",
+              artistName: s.artistName || "Unknown Artist",
+              cleanUrl: s.trackViewUrl || `https://music.apple.com/${country}/album/${id}?i=${s.trackId}`
+            }));
+
+            return {
+              success: true,
+              isPlaylist: true,
+              tracks,
+              method: "iTunes Store API Album Tracklist"
+            };
+          }
+        }
+      }
+    } catch (e) {
+      console.error("iTunes album lookup error:", e);
+    }
+  }
+
+  return null;
+}
+
 app.post("/api/parse-apple-music", async (req, res) => {
   const { url } = req.body;
   if (!url || typeof url !== "string") {
@@ -220,6 +321,7 @@ app.post("/api/parse-apple-music", async (req, res) => {
   }
 
   const cleanUrl = cleanAppleMusicUrl(url);
+  const urlDetails = parseAppleMusicUrlDetails(cleanUrl);
 
   try {
     const response = await fetch(cleanUrl, {
@@ -261,7 +363,7 @@ app.post("/api/parse-apple-music", async (req, res) => {
     if (allTracks.length === 0) {
       if (looksBlocked) {
         throw new Error(
-          `Apple Music blocked the request. Cloud hosting providers (such as DigitalOcean, AWS, Hetzner, Vercel, etc.) have their IP ranges pre-blocked by Apple's CDN. Run on another hosting platform or a residential line to avoid blocks. (HTML size: ${html.length} bytes)`
+          `Apple Music blocked the request. Cloud hosting providers (such as DigitalOcean, AWS, Hetzner, Vercel, etc.) have their IP ranges pre-blocked by Apple's CDN. (HTML size: ${html.length} bytes)`
         );
       }
       if (cleanUrl.includes("/playlist/") || cleanUrl.includes("/album/")) {
@@ -400,9 +502,33 @@ Return strictly a JSON object with this shape (no markdown, no quotes wrapping t
     });
 
   } catch (error: any) {
-    console.error("Scraper Endpoint Error:", error);
+    console.warn(`Scraping URL directly returned error: "${error.message}". Attempting unblocked store lookup fallback...`);
+    
+    if (urlDetails) {
+      const itunesResult = await fetchFromItunes(
+        urlDetails.country,
+        urlDetails.type,
+        urlDetails.id,
+        urlDetails.songId
+      );
+      if (itunesResult) {
+        console.log(`Unblocked iTunes Store lookup API succeeded using method: ${itunesResult.method}!`);
+        return res.json(itunesResult);
+      }
+    }
+
+    console.error("Scraper and iTunes backup details failed:", error);
+    
+    // Provide clean and descriptive message with browser copy-paste advice to aid the user
+    let userMsg = error.message || error;
+    if (cleanUrl.includes("/playlist/")) {
+      userMsg = `Apple Music blocked this automated request. Playlists are highly protected by Apple’s CDN. To easily bypass this block with 100% success, click the "HTML Code Paste" tab above, open the playlist in your browser, and paste the page source code. It works instantly without cloud restrictions!`;
+    } else {
+      userMsg = `Apple Music blocked this request. (Error: ${userMsg}). For 100% success, please click the "HTML Code Paste" tab above, open your URL in your browser, and paste the page source code!`;
+    }
+
     return res.status(500).json({
-      error: `Failed to scrape or extract details: ${error.message || error}`,
+      error: userMsg
     });
   }
 });
