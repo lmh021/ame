@@ -1,0 +1,512 @@
+import express from "express";
+import path from "path";
+import { createServer as createViteServer } from "vite";
+import dotenv from "dotenv";
+import { GoogleGenAI } from "@google/genai";
+import fs from "fs";
+
+dotenv.config();
+
+const app = express();
+const PORT = 3000;
+
+app.use(express.json());
+
+// Lazy-initialized Gemini client
+let aiInstance: GoogleGenAI | null = null;
+function getGeminiClient(): GoogleGenAI | null {
+  if (!aiInstance) {
+    const key = process.env.GEMINI_API_KEY;
+    if (key) {
+      aiInstance = new GoogleGenAI({
+        apiKey: key,
+        httpOptions: {
+          headers: {
+            "User-Agent": "aistudio-build",
+          },
+        },
+      });
+    }
+  }
+  return aiInstance;
+}
+
+// Utility to clean Apple Music URLs
+function cleanAppleMusicUrl(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl.trim());
+    const clean = new URL(url.origin + url.pathname);
+    const songId = url.searchParams.get("i");
+    if (songId) {
+      clean.searchParams.set("i", songId);
+    }
+    return clean.toString();
+  } catch (e) {
+    return rawUrl.trim();
+  }
+}
+
+// Extract multiple tracks from JSON-LD and match with serialized-server-data for perfect artist info
+function extractTracksFromJsonLd(html: string): { songName: string; artistName: string; cleanUrl: string }[] {
+  const tracks: { songName: string; artistName: string; cleanUrl: string }[] = [];
+  const artistMap = new Map<string, string>();
+
+  // 1. First build artist lookup map from serialized-server-data script tag if present
+  try {
+    const serverDataRegex = /<script\b[^>]*id=["']serialized-server-data["'][^>]*>([\s\S]*?)<\/script>/i;
+    const serverMatch = serverDataRegex.exec(html);
+    if (serverMatch) {
+      const parsedServer = JSON.parse(serverMatch[1].trim());
+      const traverseServer = (node: any) => {
+        if (!node || typeof node !== "object") return;
+        if (Array.isArray(node)) {
+          for (const sub of node) traverseServer(sub);
+          return;
+        }
+        if (node.artistName && (node.title || node.name)) {
+          const t = node.title || node.name;
+          artistMap.set(t.toLowerCase().trim(), node.artistName);
+        }
+        for (const k of Object.keys(node)) {
+          traverseServer(node[k]);
+        }
+      };
+      traverseServer(parsedServer);
+    }
+  } catch (e) {
+    console.error("Serialized server data parsing error:", e);
+  }
+
+  // 2. Extract song info + url from application/ld+json (uses flexible regex for attributes)
+  try {
+    const regex = /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+    let match;
+    while ((match = regex.exec(html)) !== null) {
+      if (match[1]) {
+        try {
+          const parsed = JSON.parse(match[1].trim());
+          const items = Array.isArray(parsed) ? parsed : [parsed];
+          for (const item of items) {
+            traverseJsonLd(item, tracks, artistMap);
+          }
+        } catch (_) {}
+      }
+    }
+  } catch (e) {
+    console.error("JSON-LD tracks extraction error:", e);
+  }
+
+  // Deduplicate tracks by songName + artistName to avoid repeating songs
+  const unique = new Map<string, typeof tracks[0]>();
+  for (const t of tracks) {
+    const key = `${t.songName.toLowerCase().trim()}|||${t.artistName.toLowerCase().trim()}`;
+    if (!unique.has(key)) {
+      unique.set(key, t);
+    }
+  }
+  return Array.from(unique.values());
+}
+
+function traverseJsonLd(node: any, tracks: { songName: string; artistName: string; cleanUrl: string }[], artistMap: Map<string, string>) {
+  if (!node || typeof node !== "object") return;
+
+  if (Array.isArray(node)) {
+    for (const sub of node) {
+      traverseJsonLd(sub, tracks, artistMap);
+    }
+    return;
+  }
+
+  // Handle direct MusicRecording or Song nodes
+  if (node["@type"] === "MusicRecording" || node["@type"] === "Song") {
+    const songName = node.name;
+    if (songName) {
+      let artistName = "Unknown Artist";
+      
+      // Match with the artistMap from serialized-server-data first
+      const key = songName.toLowerCase().trim();
+      let matchedArtist = artistMap.get(key);
+      if (!matchedArtist) {
+        for (const [titleKey, artist] of artistMap.entries()) {
+          if (titleKey.includes(key) || key.includes(titleKey)) {
+            matchedArtist = artist;
+            break;
+          }
+        }
+      }
+
+      if (matchedArtist) {
+        artistName = matchedArtist;
+      } else if (node.byArtist) {
+        artistName = Array.isArray(node.byArtist)
+          ? node.byArtist[0]?.name || "Unknown Artist"
+          : (node.byArtist.name || node.byArtist || "Unknown Artist");
+      }
+      
+      const rawUrl = node.url || "";
+      tracks.push({
+        songName,
+        artistName,
+        cleanUrl: rawUrl ? cleanAppleMusicUrl(rawUrl) : ""
+      });
+    }
+  }
+
+  // Handle ListItem nodes wrapping a MusicRecording or Song
+  if (node["@type"] === "ListItem" && node.item) {
+    const item = node.item;
+    if (item["@type"] === "MusicRecording" || item["@type"] === "Song" || item.name) {
+      const songName = item.name;
+      if (songName) {
+        let artistName = "Unknown Artist";
+        
+        // Match with the artistMap from serialized-server-data first
+        const key = songName.toLowerCase().trim();
+        let matchedArtist = artistMap.get(key);
+        if (!matchedArtist) {
+          for (const [titleKey, artist] of artistMap.entries()) {
+            if (titleKey.includes(key) || key.includes(titleKey)) {
+              matchedArtist = artist;
+              break;
+            }
+          }
+        }
+
+        if (matchedArtist) {
+          artistName = matchedArtist;
+        } else if (item.byArtist) {
+          artistName = Array.isArray(item.byArtist)
+            ? item.byArtist[0]?.name || "Unknown Artist"
+            : (item.byArtist.name || item.byArtist || "Unknown Artist");
+        }
+        
+        const rawUrl = item.url || "";
+        tracks.push({
+          songName,
+          artistName,
+          cleanUrl: rawUrl ? cleanAppleMusicUrl(rawUrl) : ""
+        });
+      }
+      return;
+    }
+  }
+
+  // Recursively inspect any properties
+  for (const key of Object.keys(node)) {
+    traverseJsonLd(node[key], tracks, artistMap);
+  }
+}
+
+// Regex meta-tags extraction fallback
+function extractMeta(html: string) {
+  const ogTitleMatch = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i) || 
+                       html.match(/<meta\s+content=["']([^"']+)["']\s+property=["']og:title["']/i);
+  const ogDescMatch = html.match(/<meta\s+property=["']og:description["']\s+content=["']([^"']+)["']/i) ||
+                      html.match(/<meta\s+content=["']([^"']+)["']\s+property=["']og:description["']/i);
+  const titleTagMatch = html.match(/<title>([^<]+)<\/title>/i);
+
+  const ogTitle = ogTitleMatch ? ogTitleMatch[1] : "";
+  const ogDescription = ogDescMatch ? ogDescMatch[1] : "";
+  const titleTag = titleTagMatch ? titleTagMatch[1] : "";
+
+  return { ogTitle, ogDescription, titleTag };
+}
+
+// API endpoint to parse Apple Music links
+app.post("/api/parse-apple-music", async (req, res) => {
+  const { url } = req.body;
+  if (!url || typeof url !== "string") {
+    return res.status(400).json({ error: "A valid URL is required" });
+  }
+
+  const cleanUrl = cleanAppleMusicUrl(url);
+
+  try {
+    const response = await fetch(cleanUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch page: HTTP ${response.status}`);
+    }
+
+    const html = await response.text();
+
+    // 1. Try JSON-LD tracks extraction (covers both single tracks, full albums, and playlists!)
+    const allTracks = extractTracksFromJsonLd(html);
+
+    if (allTracks.length > 0) {
+      // Check if URL has a specific track ID query parameter "?i=..." 
+      let searchSongId: string | null = null;
+      try {
+        const urlObj = new URL(cleanUrl);
+        searchSongId = urlObj.searchParams.get("i");
+      } catch (_) {}
+
+      // If they passed a single track URL with "?i=XXXX", try to find a precise match
+      if (searchSongId) {
+        const matched = allTracks.find(t => {
+          try {
+            const u = new URL(t.cleanUrl);
+            return u.searchParams.get("i") === searchSongId;
+          } catch (_) {
+            return false;
+          }
+        });
+        if (matched) {
+          return res.json({
+            success: true,
+            songName: matched.songName,
+            artistName: matched.artistName,
+            cleanUrl: matched.cleanUrl,
+            method: "JSON-LD Specific Track Match"
+          });
+        }
+      }
+
+      // If it is a playlist or album, OR they didn't specify/match a single song ID, and there are multiple tracks:
+      // Return the full batch!
+      if (allTracks.length > 1 || cleanUrl.includes("/playlist/") || cleanUrl.includes("/album/")) {
+        // Fallback for self-contained clean URLs: if cleanUrl is on any tracks
+        const tracksResult = allTracks.map(t => ({
+          songName: t.songName,
+          artistName: t.artistName,
+          cleanUrl: t.cleanUrl || cleanUrl
+        }));
+
+        return res.json({
+          success: true,
+          isPlaylist: true,
+          tracks: tracksResult,
+          method: "JSON-LD Batch Extract"
+        });
+      }
+
+      // Single track fallback (if only 1 track exists in the entire list)
+      return res.json({
+        success: true,
+        songName: allTracks[0].songName,
+        artistName: allTracks[0].artistName,
+        cleanUrl: allTracks[0].cleanUrl || cleanUrl,
+        method: "JSON-LD Single Track"
+      });
+    }
+
+    // 2. Extract standard meta elements as fallback
+    const meta = extractMeta(html);
+
+    // 3. Try to use Gemini to analyze meta elements and parse accurately
+    const ai = getGeminiClient();
+    if (ai) {
+      try {
+        const prompt = `You are an expert music metadata extractor. We need to parse an Apple Music song page's text metadata into clean fields.
+URL: ${cleanUrl}
+Meta Title: ${meta.ogTitle}
+Meta Description: ${meta.ogDescription}
+Page HTML Title: ${meta.titleTag}
+
+Extract the exact track/song name and artist name.
+Return strictly a JSON object with this shape (no markdown, no quotes wrapping the JSON block):
+{
+  "songName": "Song Name Here",
+  "artistName": "Artist Name Here"
+}`;
+
+        const geminiResult = await ai.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+          },
+        });
+
+        const parsed = JSON.parse(geminiResult.text?.trim() || "{}");
+        if (parsed.songName) {
+          return res.json({
+            success: true,
+            songName: parsed.songName,
+            artistName: parsed.artistName || "Unknown Artist",
+            cleanUrl,
+            method: "Gemini AI Semantic Parsing",
+          });
+        }
+      } catch (geminiError) {
+        console.error("Gemini metadata parser error:", geminiError);
+      }
+    }
+
+    // 4. Manual Fallback Regex Parsing
+    let songName = "";
+    let artistName = "";
+
+    if (meta.ogTitle) {
+      if (meta.ogTitle.includes(" - Song by ")) {
+        const parts = meta.ogTitle.split(" - Song by ");
+        songName = parts[0].trim();
+        artistName = parts[1].split(" on Apple Music")[0].trim();
+      } else if (meta.ogTitle.includes(" by ")) {
+        const parts = meta.ogTitle.split(" by ");
+        songName = parts[0].trim();
+        artistName = parts[1].split(" on Apple Music")[0].trim();
+      } else {
+        songName = meta.ogTitle.replace(" on Apple Music", "").trim();
+        artistName = meta.ogDescription ? meta.ogDescription.split("·")[0].trim() : "Unknown Artist";
+      }
+    } else {
+      songName = "Unknown Song";
+      artistName = "Unknown Artist";
+    }
+
+    return res.json({
+      success: true,
+      songName,
+      artistName,
+      cleanUrl,
+      method: "Manual Fallback Parsing",
+    });
+
+  } catch (error: any) {
+    console.error("Scraper Endpoint Error:", error);
+    return res.status(500).json({
+      error: `Failed to scrape or extract details: ${error.message || error}`,
+    });
+  }
+});
+
+// Local Database File Setup for on-screen sheets
+const DATABASE_FILE = path.join(process.cwd(), "database.json");
+
+interface LocalSheetRow {
+  rowNum: number;
+  songName: string;
+  artistName: string;
+  cleanUrl: string;
+  dateAdded: string;
+}
+
+function getDatabase(): LocalSheetRow[] {
+  if (!fs.existsSync(DATABASE_FILE)) {
+    const initialRows: LocalSheetRow[] = [
+      {
+        rowNum: 1,
+        songName: "Starboy (feat. Daft Punk)",
+        artistName: "The Weeknd",
+        cleanUrl: "https://music.apple.com/us/album/starboy-feat-daft-punk/1170696519?i=1170696522",
+        dateAdded: new Date().toISOString().split("T")[0]
+      },
+      {
+        rowNum: 2,
+        songName: "Blinding Lights",
+        artistName: "The Weeknd",
+        cleanUrl: "https://music.apple.com/us/album/blinding-lights/1499385848?i=1499385850",
+        dateAdded: new Date().toISOString().split("T")[0]
+      }
+    ];
+    fs.writeFileSync(DATABASE_FILE, JSON.stringify(initialRows, null, 2), "utf8");
+    return initialRows;
+  }
+  try {
+    const data = fs.readFileSync(DATABASE_FILE, "utf8");
+    return JSON.parse(data);
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveDatabase(rows: LocalSheetRow[]) {
+  fs.writeFileSync(DATABASE_FILE, JSON.stringify(rows, null, 2), "utf8");
+}
+
+// 1. Get entire spreadsheet contents
+app.get("/api/sheet", (req, res) => {
+  try {
+    const rows = getDatabase();
+    res.json(rows);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 2. Save full spreadsheet (edits, cell updates, manual additions, sort orders)
+app.post("/api/sheet/save", (req, res) => {
+  try {
+    const { rows } = req.body;
+    if (!Array.isArray(rows)) {
+      return res.status(400).json({ error: "rows must be an array" });
+    }
+    // Re-verify index numbers sequentially
+    const currentRows: LocalSheetRow[] = rows.map((r, i) => ({
+      rowNum: i + 1,
+      songName: r.songName || "",
+      artistName: r.artistName || "",
+      cleanUrl: r.cleanUrl || "",
+      dateAdded: r.dateAdded || new Date().toISOString().split("T")[0]
+    }));
+    saveDatabase(currentRows);
+    res.json({ success: true, count: currentRows.length });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 3. Append new tracks securely (without full write client side)
+app.post("/api/sheet/append", (req, res) => {
+  try {
+    const { newRows } = req.body;
+    if (!Array.isArray(newRows)) {
+      return res.status(400).json({ error: "newRows must be an array" });
+    }
+    const current = getDatabase();
+    const nextOffset = current.length > 0 ? Math.max(...current.map(r => r.rowNum)) + 1 : 1;
+
+    const formatted: LocalSheetRow[] = newRows.map((r, i) => ({
+      rowNum: nextOffset + i,
+      songName: r.songName || "",
+      artistName: r.artistName || "",
+      cleanUrl: r.cleanUrl || "",
+      dateAdded: r.dateAdded || new Date().toISOString().split("T")[0]
+    }));
+
+    const updated = [...current, ...formatted];
+    saveDatabase(updated);
+    res.json({ success: true, updatedCount: updated.length, added: formatted });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 4. Wipe sheet clean
+app.post("/api/sheet/clear", (req, res) => {
+  try {
+    saveDatabase([]);
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Start integration with Vite or production Static distribution
+async function initServer() {
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+initServer();

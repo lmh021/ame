@@ -1,0 +1,6 @@
+{
+  "name": "Apple Music Integration",
+  "description": "Extract Apple Music tracks metadata and log them sequentially into an attached Google Sheets spreadsheet with strict append-only verification.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
