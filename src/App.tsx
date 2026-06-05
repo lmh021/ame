@@ -276,8 +276,11 @@ export default function App() {
 
       allLinks.forEach((a) => {
         const href = a.getAttribute("href") || "";
-        // Look for links referencing song with its query ID '?i=' or '/album/' path
-        if (href.includes("/album/") && (href.includes("?i=") || href.includes("&i="))) {
+        // Look for links referencing song with its query ID '?i=' or '/album/' path, or raw '/song/' path
+        if (
+          (href.includes("/album/") && (href.includes("?i=") || href.includes("&i="))) ||
+          href.includes("/song/")
+        ) {
           // Ascend container elements to discover enclosing rows
           let rowContainer: HTMLElement | null = a.parentElement;
           let depth = 0;
@@ -373,7 +376,7 @@ export default function App() {
         rows.forEach((rowEl) => {
           const titleEl = rowEl.querySelector('[class*="title"], [class*="song-name"], [class*="track-name"]');
           const artistEl = rowEl.querySelector('[class*="artist"], [class*="by-line"], [class*="creator"]');
-          const linkEl = rowEl.querySelector('a[href*="/album/"]');
+          const linkEl = rowEl.querySelector('a[href*="/album/"], a[href*="/song/"]');
 
           let songName = titleEl?.textContent?.trim() || "";
           songName = songName.replace(/^\d+[\.\s\-]+/, "").trim();
@@ -397,6 +400,79 @@ export default function App() {
 
     } catch (domErr) {
       console.error("Client DOMParser error:", domErr);
+    }
+
+    // 4. Robust Plain Text / Selecion-Copy-Paste Scanner Fallback
+    // Handles plain text selections where links or tags don't exist
+    if (tracks.length === 0) {
+      const cleanLines = html
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+
+      let idx = 0;
+      while (idx < cleanLines.length) {
+        const line = cleanLines[idx];
+
+        // Pattern A: Segment blocks copying (e.g. Multi-line selection outputs):
+        // idx  : Track Number (e.g., "1" or "01")
+        // idx+1: Song Title
+        // idx+2: Artist Name
+        // idx+3: Album Name or Duration (duration format "\d+:\d+")
+        // idx+4: Duration
+        if (/^\d+$/.test(line) && idx + 2 < cleanLines.length) {
+          let matched = false;
+          // Span search offsets representing where a time duration might appear
+          for (const offset of [3, 4, 5]) {
+            if (idx + offset < cleanLines.length) {
+              const item = cleanLines[idx + offset];
+              if (/^\d{1,2}:\d{2}$/.test(item)) {
+                const songName = cleanLines[idx + 1];
+                const artistName = cleanLines[idx + 2];
+                if (songName && artistName && !/^\d+$/.test(songName) && !/^\d+$/.test(artistName) && !songName.toLowerCase().includes("duration") && !artistName.toLowerCase().includes("duration")) {
+                  tracks.push({
+                    songName: songName.replace(/^\d+[\.\s\-]+/, "").trim(),
+                    artistName: artistName,
+                    cleanUrl: ""
+                  });
+                  idx += offset; // Fast-forward scanner past this block
+                  matched = true;
+                  break;
+                }
+              }
+            }
+          }
+          if (matched) {
+            idx++;
+            continue;
+          }
+        }
+
+        // Pattern B: Dash/Slash separated single line configurations:
+        // E.g. "Song Name - Artist Name" or "Artist - Song Title" or "1. Song Name — Artist Name"
+        const dashRegex = /^(\d+[\.\s\-\)]+)?(.+?)\s+[\u2502\u2014\u2013\|\-]\s+(.+)$/;
+        const dashMatch = dashRegex.exec(line);
+        if (dashMatch) {
+          const songPart = dashMatch[2].trim();
+          const artistPart = dashMatch[3].trim();
+          
+          if (
+            songPart && artistPart && 
+            !songPart.toLowerCase().includes("duration") && 
+            !artistPart.toLowerCase().includes("duration") &&
+            !/^\d{1,2}:\d{2}$/.test(songPart) && 
+            !/^\d{1,2}:\d{2}$/.test(artistPart)
+          ) {
+            tracks.push({
+              songName: songPart,
+              artistName: artistPart,
+              cleanUrl: ""
+            });
+          }
+        }
+
+        idx++;
+      }
     }
 
     // Deduplicate
