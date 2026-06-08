@@ -1,23 +1,24 @@
 import fetch from "node-fetch";
 
-import { execSync } from "child_process";
+async function testFetch(url: string, options: any) {
+  try {
+    const res = await fetch(url, options);
+    console.log(`FETCH ${url} -> Status: ${res.status}`);
+    const text = await res.text();
+    console.log(`REPLY SIZE: ${text.length} bytes`);
+  } catch (err: any) {
+    console.error(`FETCH ${url} FAILED:`, err.message);
+  }
+}
 
 async function run() {
-  console.log("--- SCANNING FOR PORT 3000 PROCESSES ---");
-  try {
-    const list = execSync("ss -lptn 'sport = :3000' || netstat -lptn | grep 3000 || lsof -i :3000", { encoding: "utf8" });
-    console.log("Processes listening on port 3000:\n", list);
-  } catch (err: any) {
-    console.log("No process found on port 3000 or utility missing. Error message:", err.message);
-  }
-
-  console.log("\n--- SCANNING ALL NODE/TSX PROCESSES ---");
-  try {
-    const ps = execSync("ps aux | grep -E 'node|tsx|vite' | grep -v grep", { encoding: "utf8" });
-    console.log("Active processes:\n", ps);
-  } catch (err: any) {
-    console.log("Failed to list processes or ps utility missing. Error message:", err.message);
-  }
+  console.log("Sending local requests...");
+  await testFetch("http://localhost:3000/api/sheet", { method: "GET" });
+  await testFetch("http://localhost:3000/api/parse-apple-music", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url: "https://music.apple.com/us/album/starboy/1440870373" })
+  });
 }
 
 run();

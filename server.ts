@@ -12,6 +12,24 @@ const PORT = 3000;
 
 app.use(express.json());
 
+const LOG_FILE = path.join(process.cwd(), "requests.log");
+app.use((req, res, next) => {
+  const logLine = `[${new Date().toISOString()}] ${req.method} ${req.url} - IP: ${req.ip} - Origin: ${req.get('origin') || 'none'}\n`;
+  try {
+    fs.appendFileSync(LOG_FILE, logLine, "utf8");
+  } catch (_) {}
+
+  const originalSend = res.send;
+  res.send = function(body) {
+    try {
+      fs.appendFileSync(LOG_FILE, `[REPLY] ${req.method} ${req.url} -> Status: ${res.statusCode}\n`, "utf8");
+    } catch (_) {}
+    return originalSend.apply(this, arguments as any);
+  };
+
+  next();
+});
+
 // Lazy-initialized Gemini client
 let aiInstance: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI | null {
@@ -376,128 +394,139 @@ async function fetchFromItunes(country: string, type: string, id: string, songId
   return null;
 }
 
-app.post(["/api/parse-apple-music", "/api/parse-apple-music/", "/api/parse", "/api/parse/", "/api/parse-music", "/api/scrape", "/api/crawl"], async (req, res) => {
-  const { url } = req.body;
-  if (!url || typeof url !== "string") {
-    return res.status(400).json({ error: "A valid URL is required" });
-  }
+const appleMusicRoutes = [
+  "/api/parse-apple-music",
+  "/api/parse-apple-music/",
+  "/api/parse",
+  "/api/parse/",
+  "/api/parse-music",
+  "/api/scrape",
+  "/api/crawl"
+];
 
-  const cleanUrl = cleanAppleMusicUrl(url);
-  const urlDetails = parseAppleMusicUrlDetails(cleanUrl);
-
-  try {
-    const response = await fetch(cleanUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Ch-Ua": "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"",
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": "\"Windows\"",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "Connection": "keep-alive",
-        "Cache-Control": "max-age=0"
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch page: HTTP ${response.status}`);
+for (const route of appleMusicRoutes) {
+  app.post(route, async (req, res) => {
+    const { url } = req.body;
+    if (!url || typeof url !== "string") {
+      return res.status(400).json({ error: "A valid URL is required" });
     }
 
-    const html = await response.text();
+    const cleanUrl = cleanAppleMusicUrl(url);
+    const urlDetails = parseAppleMusicUrlDetails(cleanUrl);
 
-    // 1. Try JSON-LD tracks extraction (covers both single tracks, full albums, and playlists!)
-    const allTracks = extractTracksFromJsonLd(html);
+    try {
+      const response = await fetch(cleanUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Sec-Ch-Ua": "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"",
+          "Sec-Ch-Ua-Mobile": "?0",
+          "Sec-Ch-Ua-Platform": "\"Windows\"",
+          "Sec-Fetch-Dest": "document",
+          "Sec-Fetch-Mode": "navigate",
+          "Sec-Fetch-Site": "none",
+          "Sec-Fetch-User": "?1",
+          "Upgrade-Insecure-Requests": "1",
+          "Connection": "keep-alive",
+          "Cache-Control": "max-age=0"
+        },
+      });
 
-    // Block detection
-    const looksBlocked = html.length < 15000 || 
-                         html.includes("Access Denied") || 
-                         html.includes("captcha") || 
-                         html.includes("robot") || 
-                         html.includes("forbidden") || 
-                         html.includes("verify your identity") ||
-                         html.includes("unusual traffic");
-
-    if (allTracks.length === 0) {
-      if (looksBlocked) {
-        throw new Error(
-          `Apple Music blocked the request. Cloud hosting providers (such as DigitalOcean, AWS, Hetzner, Vercel, etc.) have their IP ranges pre-blocked by Apple's CDN. (HTML size: ${html.length} bytes)`
-        );
+      if (!response.ok) {
+        throw new Error(`Failed to fetch page: HTTP ${response.status}`);
       }
-      if (cleanUrl.includes("/playlist/") || cleanUrl.includes("/album/")) {
-        throw new Error("The playlist/album URL loaded successfully but contains 0 publicly accessible tracks. Make sure the playlist/album is shared and set to public.");
-      }
-    }
 
-    if (allTracks.length > 0) {
-      // Check if URL has a specific track ID query parameter "?i=..." 
-      let searchSongId: string | null = null;
-      try {
-        const urlObj = new URL(cleanUrl);
-        searchSongId = urlObj.searchParams.get("i");
-      } catch (_) {}
+      const html = await response.text();
 
-      // If they passed a single track URL with "?i=XXXX", try to find a precise match
-      if (searchSongId) {
-        const matched = allTracks.find(t => {
-          try {
-            const u = new URL(t.cleanUrl);
-            return u.searchParams.get("i") === searchSongId;
-          } catch (_) {
-            return false;
-          }
-        });
-        if (matched) {
-          return res.json({
-            success: true,
-            songName: matched.songName,
-            artistName: matched.artistName,
-            cleanUrl: matched.cleanUrl,
-            method: "JSON-LD Specific Track Match"
-          });
+      // 1. Try JSON-LD tracks extraction (covers both single tracks, full albums, and playlists!)
+      const allTracks = extractTracksFromJsonLd(html);
+
+      // Block detection
+      const looksBlocked = html.length < 15000 || 
+                           html.includes("Access Denied") || 
+                           html.includes("captcha") || 
+                           html.includes("robot") || 
+                           html.includes("forbidden") || 
+                           html.includes("verify your identity") ||
+                           html.includes("unusual traffic");
+
+      if (allTracks.length === 0) {
+        if (looksBlocked) {
+          throw new Error(
+            `Apple Music blocked the request. Cloud hosting providers (such as DigitalOcean, AWS, Hetzner, Vercel, etc.) have their IP ranges pre-blocked by Apple's CDN. (HTML size: ${html.length} bytes)`
+          );
+        }
+        if (cleanUrl.includes("/playlist/") || cleanUrl.includes("/album/")) {
+          throw new Error("The playlist/album URL loaded successfully but contains 0 publicly accessible tracks. Make sure the playlist/album is shared and set to public.");
         }
       }
 
-      // If it is a playlist or album, OR they didn't specify/match a single song ID, and there are multiple tracks:
-      // Return the full batch!
-      if (allTracks.length > 1 || cleanUrl.includes("/playlist/") || cleanUrl.includes("/album/")) {
-        // Fallback for self-contained clean URLs: if cleanUrl is on any tracks
-        const tracksResult = allTracks.map(t => ({
-          songName: t.songName,
-          artistName: t.artistName,
-          cleanUrl: t.cleanUrl || cleanUrl
-        }));
+      if (allTracks.length > 0) {
+        // Check if URL has a specific track ID query parameter "?i=..." 
+        let searchSongId: string | null = null;
+        try {
+          const urlObj = new URL(cleanUrl);
+          searchSongId = urlObj.searchParams.get("i");
+        } catch (_) {}
 
+        // If they passed a single track URL with "?i=XXXX", try to find a precise match
+        if (searchSongId) {
+          const matched = allTracks.find(t => {
+            try {
+              const u = new URL(t.cleanUrl);
+              return u.searchParams.get("i") === searchSongId;
+            } catch (_) {
+              return false;
+            }
+          });
+          if (matched) {
+            return res.json({
+              success: true,
+              songName: matched.songName,
+              artistName: matched.artistName,
+              cleanUrl: matched.cleanUrl,
+              method: "JSON-LD Specific Track Match"
+            });
+          }
+        }
+
+        // If it is a playlist or album, OR they didn't specify/match a single song ID, and there are multiple tracks:
+        // Return the full batch!
+        if (allTracks.length > 1 || cleanUrl.includes("/playlist/") || cleanUrl.includes("/album/")) {
+          // Fallback for self-contained clean URLs: if cleanUrl is on any tracks
+          const tracksResult = allTracks.map(t => ({
+            songName: t.songName,
+            artistName: t.artistName,
+            cleanUrl: t.cleanUrl || cleanUrl
+          }));
+
+          return res.json({
+            success: true,
+            isPlaylist: true,
+            tracks: tracksResult,
+            method: "JSON-LD Batch Extract"
+          });
+        }
+
+        // Single track fallback (if only 1 track exists in the entire list)
         return res.json({
           success: true,
-          isPlaylist: true,
-          tracks: tracksResult,
-          method: "JSON-LD Batch Extract"
+          songName: allTracks[0].songName,
+          artistName: allTracks[0].artistName,
+          cleanUrl: allTracks[0].cleanUrl || cleanUrl,
+          method: "JSON-LD Single Track"
         });
       }
 
-      // Single track fallback (if only 1 track exists in the entire list)
-      return res.json({
-        success: true,
-        songName: allTracks[0].songName,
-        artistName: allTracks[0].artistName,
-        cleanUrl: allTracks[0].cleanUrl || cleanUrl,
-        method: "JSON-LD Single Track"
-      });
-    }
+      // 2. Extract standard meta elements as fallback
+      const meta = extractMeta(html);
 
-    // 2. Extract standard meta elements as fallback
-    const meta = extractMeta(html);
-
-    // 3. Try to use Gemini to analyze meta elements and parse accurately
-    const ai = getGeminiClient();
-    if (ai) {
-      try {
-        const prompt = `You are an expert music metadata extractor. We need to parse an Apple Music song page's text metadata into clean fields.
+      // 3. Try to use Gemini to analyze meta elements and parse accurately
+      const ai = getGeminiClient();
+      if (ai) {
+        try {
+          const prompt = `You are an expert music metadata extractor. We need to parse an Apple Music song page's text metadata into clean fields.
 URL: ${cleanUrl}
 Meta Title: ${meta.ogTitle}
 Meta Description: ${meta.ogDescription}
@@ -510,106 +539,113 @@ Return strictly a JSON object with this shape (no markdown, no quotes wrapping t
   "artistName": "Artist Name Here"
 }`;
 
-        const geminiResult = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: prompt,
-          config: {
-            responseMimeType: "application/json",
-          },
-        });
-
-        const parsed = JSON.parse(geminiResult.text?.trim() || "{}");
-        if (parsed.songName) {
-          return res.json({
-            success: true,
-            songName: parsed.songName,
-            artistName: parsed.artistName || "Unknown Artist",
-            cleanUrl,
-            method: "Gemini AI Semantic Parsing",
+          const geminiResult = await ai.models.generateContent({
+            model: "gemini-3.5-flash",
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+            },
           });
+
+          const parsed = JSON.parse(geminiResult.text?.trim() || "{}");
+          if (parsed.songName) {
+            return res.json({
+              success: true,
+              songName: parsed.songName,
+              artistName: parsed.artistName || "Unknown Artist",
+              cleanUrl,
+              method: "Gemini AI Semantic Parsing",
+            });
+          }
+        } catch (geminiError) {
+          console.error("Gemini metadata parser error:", geminiError);
         }
-      } catch (geminiError) {
-        console.error("Gemini metadata parser error:", geminiError);
       }
-    }
 
-    // 4. Manual Fallback Regex Parsing
-    let songName = "";
-    let artistName = "";
+      // 4. Manual Fallback Regex Parsing
+      let songName = "";
+      let artistName = "";
 
-    if (meta.ogTitle) {
-      if (meta.ogTitle.includes(" - Song by ")) {
-        const parts = meta.ogTitle.split(" - Song by ");
-        songName = parts[0].trim();
-        artistName = parts[1].split(" on Apple Music")[0].trim();
-      } else if (meta.ogTitle.includes(" by ")) {
-        const parts = meta.ogTitle.split(" by ");
-        songName = parts[0].trim();
-        artistName = parts[1].split(" on Apple Music")[0].trim();
+      if (meta.ogTitle) {
+        if (meta.ogTitle.includes(" - Song by ")) {
+          const parts = meta.ogTitle.split(" - Song by ");
+          songName = parts[0].trim();
+          artistName = parts[1].split(" on Apple Music")[0].trim();
+        } else if (meta.ogTitle.includes(" by ")) {
+          const parts = meta.ogTitle.split(" by ");
+          songName = parts[0].trim();
+          artistName = parts[1].split(" on Apple Music")[0].trim();
+        } else {
+          songName = meta.ogTitle.replace(" on Apple Music", "").trim();
+          artistName = meta.ogDescription ? meta.ogDescription.split("·")[0].trim() : "Unknown Artist";
+        }
       } else {
-        songName = meta.ogTitle.replace(" on Apple Music", "").trim();
-        artistName = meta.ogDescription ? meta.ogDescription.split("·")[0].trim() : "Unknown Artist";
+        songName = "Unknown Song";
+        artistName = "Unknown Artist";
       }
-    } else {
-      songName = "Unknown Song";
-      artistName = "Unknown Artist";
-    }
 
-    return res.json({
-      success: true,
-      songName,
-      artistName,
-      cleanUrl,
-      method: "Manual Fallback Parsing",
-    });
+      return res.json({
+        success: true,
+        songName,
+        artistName,
+        cleanUrl,
+        method: "Manual Fallback Parsing",
+      });
 
-  } catch (error: any) {
-    console.warn(`Scraping URL directly returned error: "${error.message}". Attempting unblocked store lookup fallback...`);
-    
-    if (urlDetails) {
-      const itunesResult = await fetchFromItunes(
-        urlDetails.country,
-        urlDetails.type,
-        urlDetails.id,
-        urlDetails.songId,
-        urlDetails.searchTerm
-      );
-      if (itunesResult) {
-        console.log(`Unblocked iTunes Store lookup API succeeded using method: ${itunesResult.method}!`);
-        return res.json(itunesResult);
+    } catch (error: any) {
+      console.warn(`Scraping URL directly returned error: "${error.message}". Attempting unblocked store lookup fallback...`);
+      
+      if (urlDetails) {
+        const itunesResult = await fetchFromItunes(
+          urlDetails.country,
+          urlDetails.type,
+          urlDetails.id,
+          urlDetails.songId,
+          urlDetails.searchTerm
+        );
+        if (itunesResult) {
+          console.log(`Unblocked iTunes Store lookup API succeeded using method: ${itunesResult.method}!`);
+          return res.json(itunesResult);
+        }
       }
-    }
 
-    console.error("Scraper and iTunes backup details failed:", error);
-    
-    // Provide clean and descriptive message with browser copy-paste advice to aid the user
-    let userMsg = error.message || error;
-    if (cleanUrl.includes("/playlist/")) {
-      userMsg = `Apple Music blocked this automated request. Playlists are highly protected by Apple’s CDN. To easily bypass this block with 100% success, click the "HTML Code Paste" tab above, open the playlist in your browser, and paste the page source code. It works instantly without cloud restrictions!`;
-    } else {
-      userMsg = `Apple Music blocked this request. (Error: ${userMsg}). For 100% success, please click the "HTML Code Paste" tab above, open your URL in your browser, and paste the page source code!`;
-    }
+      console.error("Scraper and iTunes backup details failed:", error);
+      
+      // Provide clean and descriptive message with browser copy-paste advice to aid the user
+      let userMsg = error.message || error;
+      if (cleanUrl.includes("/playlist/")) {
+        userMsg = `Apple Music blocked this automated request. Playlists are highly protected by Apple’s CDN. To easily bypass this block with 100% success, click the "HTML Code Paste" tab above, open the playlist in your browser, and paste the page source code. It works instantly without cloud restrictions!`;
+      } else {
+        userMsg = `Apple Music blocked this request. (Error: ${userMsg}). For 100% success, please click the "HTML Code Paste" tab above, open your URL in your browser, and paste the page source code!`;
+      }
 
-    return res.status(500).json({
-      error: userMsg
-    });
-  }
-});
+      return res.status(500).json({
+        error: userMsg
+      });
+    }
+  });
+}
 
 // Endpoint to parse copy-pasted HTML or plaintext using Gemini AI
-app.post(["/api/parse-pasted-content", "/api/parse-pasted-content/"], async (req, res) => {
-  const { content } = req.body;
-  if (!content || typeof content !== "string") {
-    return res.status(400).json({ error: "Content is required" });
-  }
+const pastedContentRoutes = [
+  "/api/parse-pasted-content",
+  "/api/parse-pasted-content/"
+];
 
-  const ai = getGeminiClient();
-  if (!ai) {
-    return res.status(500).json({ error: "Gemini API key is not configured. Please add it to your settings." });
-  }
+for (const route of pastedContentRoutes) {
+  app.post(route, async (req, res) => {
+    const { content } = req.body;
+    if (!content || typeof content !== "string") {
+      return res.status(400).json({ error: "Content is required" });
+    }
 
-  try {
-    const prompt = `You are an expert music metadata extractor. The user has provided an outline or text copy-pasted of an Apple Music playlist, album, or song page.
+    const ai = getGeminiClient();
+    if (!ai) {
+      return res.status(500).json({ error: "Gemini API key is not configured. Please add it to your settings." });
+    }
+
+    try {
+      const prompt = `You are an expert music metadata extractor. The user has provided an outline or text copy-pasted of an Apple Music playlist, album, or song page.
 Extract ALL tracks mentioned in the content.
 For each track, identify:
 1. songName: The clean title of the song (exclude track index/number prefixes or duration times).
@@ -631,34 +667,35 @@ Content to parse:
 ${content.substring(0, 45000)}
 `;
 
-    const geminiResult = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-      },
-    });
+      const geminiResult = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+        },
+      });
 
-    const textResult = geminiResult.text?.trim() || "{}";
-    try {
-      const parsed = JSON.parse(textResult);
-      if (parsed.tracks && Array.isArray(parsed.tracks)) {
-        return res.json({
-          success: true,
-          tracks: parsed.tracks,
-          method: "Gemini AI Paste Parser"
-        });
+      const textResult = geminiResult.text?.trim() || "{}";
+      try {
+        const parsed = JSON.parse(textResult);
+        if (parsed.tracks && Array.isArray(parsed.tracks)) {
+          return res.json({
+            success: true,
+            tracks: parsed.tracks,
+            method: "Gemini AI Paste Parser"
+          });
+        }
+        throw new Error("Invalid output format from AI model");
+      } catch (parseErr: any) {
+        console.error("Gemini output parsing failed:", textResult, parseErr);
+        return res.status(500).json({ error: "Failed to parse AI structure: " + parseErr.message });
       }
-      throw new Error("Invalid output format from AI model");
-    } catch (parseErr: any) {
-      console.error("Gemini output parsing failed:", textResult, parseErr);
-      return res.status(500).json({ error: "Failed to parse AI structure: " + parseErr.message });
+    } catch (err: any) {
+      console.error("Gemini pasted content error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
     }
-  } catch (err: any) {
-    console.error("Gemini pasted content error:", err);
-    return res.status(500).json({ error: err.message || String(err) });
-  }
-});
+  });
+}
 
 // Local Database File Setup for on-screen sheets
 const DATABASE_FILE = path.join(process.cwd(), "database.json");
