@@ -87,7 +87,7 @@ export default function App() {
     setLoadingSheet(true);
     setSheetError(null);
     try {
-      const response = await fetch("/api/sheet");
+      const response = await fetch(`/api/sheet?t=${Date.now()}`);
       const contentType = response.headers.get("content-type") || "";
       if (contentType.includes("text/html")) {
         throw new Error(
@@ -563,7 +563,7 @@ export default function App() {
 
         const compactContent = getCompactPageRepresentation(htmlInput);
 
-        const aiResponse = await fetch("/api/parse-pasted-content", {
+        const aiResponse = await fetch(`/api/parse-pasted-content?t=${Date.now()}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ content: compactContent })
@@ -610,7 +610,7 @@ export default function App() {
       }));
 
       // Append tracks
-      const appendResponse = await fetch("/api/sheet/append", {
+      const appendResponse = await fetch(`/api/sheet/append?t=${Date.now()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ newRows: parsedTracks })
@@ -683,7 +683,7 @@ export default function App() {
       }));
 
       try {
-        const response = await fetch("/api/parse-apple-music", {
+        const response = await fetch(`/api/parse-apple-music?t=${Date.now()}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url: rawUrl })
@@ -768,7 +768,7 @@ export default function App() {
           currentLabel: `Saving ${parsedTracks.length} tracks to the spreadsheet...`
         }));
 
-        const appendResponse = await fetch("/api/sheet/append", {
+        const appendResponse = await fetch(`/api/sheet/append?t=${Date.now()}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ newRows: parsedTracks })
@@ -798,7 +798,7 @@ export default function App() {
   // Row operations
   const handleSaveRows = async (updatedRows: SheetRow[]) => {
     try {
-      const response = await fetch("/api/sheet/save", {
+      const response = await fetch(`/api/sheet/save?t=${Date.now()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ rows: updatedRows })
@@ -853,7 +853,7 @@ export default function App() {
   const handleClearDatabase = async () => {
     if (!window.confirm("Are you sure you want to clear all rows in this sheet? This cannot be undone.")) return;
     try {
-      const response = await fetch("/api/sheet/clear", { method: "POST" });
+      const response = await fetch(`/api/sheet/clear?t=${Date.now()}`, { method: "POST" });
       if (!response.ok) throw new Error("Could not clear database.");
       setSheetRows([]);
       showToast("Ledger database wiped clean.");
@@ -968,7 +968,7 @@ export default function App() {
 
         if (parsedRows.length === 0) throw new Error("No rows could be successfully read.");
 
-        const response = await fetch("/api/sheet/append", {
+        const response = await fetch(`/api/sheet/append?t=${Date.now()}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ newRows: parsedRows })
