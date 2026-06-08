@@ -376,7 +376,7 @@ async function fetchFromItunes(country: string, type: string, id: string, songId
   return null;
 }
 
-app.post("/api/parse-apple-music", async (req, res) => {
+app.post(["/api/parse-apple-music", "/api/parse-apple-music/", "/api/parse", "/api/parse/", "/api/parse-music", "/api/scrape", "/api/crawl"], async (req, res) => {
   const { url } = req.body;
   if (!url || typeof url !== "string") {
     return res.status(400).json({ error: "A valid URL is required" });
@@ -597,7 +597,7 @@ Return strictly a JSON object with this shape (no markdown, no quotes wrapping t
 });
 
 // Endpoint to parse copy-pasted HTML or plaintext using Gemini AI
-app.post("/api/parse-pasted-content", async (req, res) => {
+app.post(["/api/parse-pasted-content", "/api/parse-pasted-content/"], async (req, res) => {
   const { content } = req.body;
   if (!content || typeof content !== "string") {
     return res.status(400).json({ error: "Content is required" });

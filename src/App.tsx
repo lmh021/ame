@@ -570,8 +570,20 @@ export default function App() {
         });
 
         if (!aiResponse.ok) {
-          const aiErr = await aiResponse.json().catch(() => ({}));
-          throw new Error(aiErr.error || "Advanced AI parsing failed to extract tracks.");
+          let errMsg = "";
+          try {
+            const errData = await aiResponse.json();
+            errMsg = errData.error || "";
+          } catch (_) {}
+
+          if (!errMsg) {
+            if (aiResponse.status === 404) {
+              errMsg = "The AI paste parsing endpoint returned 404. Please hard-refresh your browser (Ctrl+F5 or Cmd+Shift+R) to synchronize routes.";
+            } else {
+              errMsg = `Advanced AI parsing failed with status code ${aiResponse.status}.`;
+            }
+          }
+          throw new Error(errMsg);
         }
 
         const aiData = await aiResponse.json();
@@ -685,8 +697,22 @@ export default function App() {
         }
 
         if (!response.ok) {
-          const errData = await response.json().catch(() => ({}));
-          throw new Error(errData.error || `Proxy error (HTTP ${response.status})`);
+          let errMsg = "";
+          try {
+            const errData = await response.json();
+            errMsg = errData.error || "";
+          } catch (_) {
+            // Non-JSON response or parse error
+          }
+
+          if (!errMsg) {
+            if (response.status === 404) {
+              errMsg = `The scraper endpoint returned 404. This can occur if your browser has cached an older version of the webpage. Please perform a hard-refresh (Ctrl+F5 or Cmd+Shift+R) to clear your browser's cache and activate the new routing paths.`;
+            } else {
+              errMsg = `Proxy error (HTTP ${response.status})`;
+            }
+          }
+          throw new Error(errMsg);
         }
 
         const data = await response.json();
